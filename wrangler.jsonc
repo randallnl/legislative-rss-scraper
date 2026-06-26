@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "legislative-rss-scraper",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-26",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["17 */4 * * *"]
+  },
+  "vars": {
+    "MAX_FEED_ITEMS_PER_SOURCE": "30",
+    "REQUEST_TIMEOUT_MS": "12000",
+    "MIN_MATCH_CONFIDENCE": "0.72"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nhdb",
+      "database_id": "e72f4c03-671f-47d5-8f70-a6792ba8f6c0"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "legislative-rss-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply nhdb --local",
+    "db:migrate:remote": "wrangler d1 migrations apply nhdb --remote",
+    "check": "node --check src/index.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
