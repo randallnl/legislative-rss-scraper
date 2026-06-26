@@ -1,6 +1,6 @@
 # Legislative RSS Scraper
 
-A Cloudflare Worker that watches RSS/Atom feeds, checks articles against legislators, candidates, and bills stored in your `nhdb` Cloudflare D1 database, and records article/entity mentions for review.
+A Cloudflare Worker that watches RSS/Atom feeds, checks articles against legislators, candidates, and bills stored in your `nhdb` Cloudflare D1 database, and queues matching articles for review before adding approved articles to D1.
 
 The scraper prefers feed data first. If a source has `fetch_article_pages = 1`, it also fetches the article URL and extracts readable page text when the feed summary is too thin.
 
@@ -8,9 +8,10 @@ The scraper prefers feed data first. If a source has `fetch_article_pages = 1`, 
 
 - `rss_sources`: news feeds to poll.
 - `d1_legislators`, `candidates`, and `d1_bills`: existing `nhdb` source tables used to build search terms.
-- `d1_articles`: existing `nhdb` article table where matching RSS articles are saved.
-- `d1_article_legislators`, `d1_article_bills`, and `d1_article_candidates`: article/entity link tables.
-- `rss_article_mentions`: scraper match details with confidence and context.
+- `rss_review_articles` and `rss_review_mentions`: pending scraper matches for spreadsheet review.
+- `d1_articles`: existing `nhdb` article table where approved RSS articles are saved.
+- `d1_article_legislators`, `d1_article_bills`, and `d1_article_candidates`: approved article/entity link tables.
+- `rss_article_mentions`: approved scraper match details with confidence and context.
 - `rss_article_metadata`: feed-specific article metadata.
 - `scrape_runs`: run metadata and errors.
 - `recent_entity_mentions`: a convenience view for latest matches.
@@ -67,7 +68,35 @@ Trigger a scrape manually:
 curl -X POST "http://localhost:8787/scrape?limit=20"
 ```
 
-See recent matches:
+Open pending review rows as JSON:
+
+```bash
+curl "http://localhost:8787/review?status=pending&limit=100"
+```
+
+Open the browser review UI:
+
+```bash
+open "http://localhost:8787/review-ui"
+```
+
+Approve reviewed articles by `review_id`:
+
+```bash
+curl -X POST "http://localhost:8787/approve" \
+  -H "content-type: application/json" \
+  -d '{"reviewIds":["review_abc123"],"approvedBy":"Randall","notes":"approved from sheet"}'
+```
+
+Reject reviewed articles by `review_id`:
+
+```bash
+curl -X POST "http://localhost:8787/reject" \
+  -H "content-type: application/json" \
+  -d '{"reviewIds":["review_abc123"],"notes":"not relevant"}'
+```
+
+See approved matches:
 
 ```bash
 curl "http://localhost:8787/matches?limit=25"
@@ -81,6 +110,18 @@ curl "http://localhost:8787/entities?q=smith"
 ```
 
 The Worker also runs on the cron in `wrangler.jsonc`: every four hours at minute 17.
+
+## Review UI
+
+The Worker does not write straight into approved article tables during scraping. Instead:
+
+1. Scrapes create pending rows in `rss_review_articles`.
+2. Open `/review-ui` in a browser.
+3. Review the article title, summary, source URL, matched entities, confidence, and context.
+4. Click `Approve` to promote the article into D1, or `Deny` to reject it.
+5. Approved rows are promoted into `d1_articles`, `rss_article_metadata`, `rss_article_mentions`, and the article/entity link tables.
+
+Set a Worker secret named `REVIEW_TOKEN` before approving or rejecting from the UI. `/approve` and `/reject` require an `x-review-token` header with that value.
 
 ## Default Sources
 

@@ -15,6 +15,30 @@ export default {
         return json(result);
       }
 
+      if (request.method === "GET" && url.pathname === "/review") {
+        const limit = readPositiveInt(url.searchParams.get("limit"), "100", 100);
+        const status = url.searchParams.get("status") || "pending";
+        return json(await listReviewArticles(env, { limit, status }));
+      }
+
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/review-ui")) {
+        const limit = readPositiveInt(url.searchParams.get("limit"), "50", 50);
+        const status = url.searchParams.get("status") || "pending";
+        return html(await renderReviewPage(env, { limit, status, tokenConfigured: Boolean(env.REVIEW_TOKEN) }));
+      }
+
+      if (request.method === "POST" && url.pathname === "/approve") {
+        await requireReviewToken(request, env);
+        const payload = await request.json();
+        return json(await approveReviewArticles(env, payload));
+      }
+
+      if (request.method === "POST" && url.pathname === "/reject") {
+        await requireReviewToken(request, env);
+        const payload = await request.json();
+        return json(await rejectReviewArticles(env, payload));
+      }
+
       if (request.method === "GET" && url.pathname === "/sources") {
         return json(await listSources(env));
       }
@@ -31,7 +55,10 @@ export default {
       return json({ error: "Not found" }, 404);
     } catch (error) {
       console.error(error);
-      return json({ error: "Internal error", detail: String(error?.message || error) }, 500);
+      return json(
+        { error: error?.status === 401 ? "Unauthorized" : "Internal error", detail: String(error?.message || error) },
+        error?.status || 500
+      );
     }
   },
 
@@ -52,8 +79,8 @@ export async function scrapeAllSources(env, options = {}) {
   const errors = [];
   let sourcesChecked = 0;
   let articlesSeen = 0;
-  let articlesSaved = 0;
-  let mentionsSaved = 0;
+  let articlesQueued = 0;
+  let mentionsQueued = 0;
 
   const [sources, entities] = await Promise.all([
     listSources(env),
@@ -65,8 +92,8 @@ export async function scrapeAllSources(env, options = {}) {
     try {
       const sourceResult = await scrapeSource(env, source, entities, options);
       articlesSeen += sourceResult.articlesSeen;
-      articlesSaved += sourceResult.articlesSaved;
-      mentionsSaved += sourceResult.mentionsSaved;
+      articlesQueued += sourceResult.articlesQueued;
+      mentionsQueued += sourceResult.mentionsQueued;
 
       await env.DB.prepare(
         "UPDATE rss_sources SET last_checked_at = ?, last_error = NULL, updated_at = ? WHERE id = ?"
@@ -88,13 +115,13 @@ export async function scrapeAllSources(env, options = {}) {
     new Date().toISOString(),
     sourcesChecked,
     articlesSeen,
-    articlesSaved,
-    mentionsSaved,
+    articlesQueued,
+    mentionsQueued,
     JSON.stringify(errors),
     runId
   ).run();
 
-  return { runId, sourcesChecked, articlesSeen, articlesSaved, mentionsSaved, errors };
+  return { runId, sourcesChecked, articlesSeen, articlesQueued, mentionsQueued, errors };
 }
 
 async function scrapeSource(env, source, entities, options) {
@@ -102,8 +129,8 @@ async function scrapeSource(env, source, entities, options) {
   const feedText = await fetchText(source.feed_url, timeoutMs);
   const items = parseFeed(feedText, source.feed_url).slice(0, options.limit || DEFAULT_LIMIT);
 
-  let articlesSaved = 0;
-  let mentionsSaved = 0;
+  let articlesQueued = 0;
+  let mentionsQueued = 0;
 
   for (const item of items) {
     if (!item.url || !item.title) continue;
@@ -127,18 +154,79 @@ async function scrapeSource(env, source, entities, options) {
 
     if (matches.length === 0) continue;
 
-    const articleId = await upsertArticle(env, source, item);
-    articlesSaved += 1;
-    mentionsSaved += await saveMatches(env, articleId, matches);
+    const reviewId = await upsertReviewArticle(env, source, item);
+    articlesQueued += 1;
+    mentionsQueued += await saveReviewMatches(env, reviewId, matches);
   }
 
-  return { articlesSeen: items.length, articlesSaved, mentionsSaved };
+  return { articlesSeen: items.length, articlesQueued, mentionsQueued };
 }
 
-async function upsertArticle(env, source, item) {
+async function upsertReviewArticle(env, source, item) {
   const now = new Date().toISOString();
-  const articleId = await articleIdForUrl(item.url);
+  const reviewId = await reviewIdForUrl(item.url);
   const hash = await sha256Hex(compactText([item.title, item.summary, item.content].join(" ")));
+  await env.DB.prepare(
+    `INSERT INTO rss_review_articles
+       (review_id, source_id, url, title, summary, author, published_at, feed_url, content_hash, raw_feed_item_json, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(url) DO UPDATE SET
+       source_id = excluded.source_id,
+       title = excluded.title,
+       summary = excluded.summary,
+       author = excluded.author,
+       published_at = excluded.published_at,
+       feed_url = excluded.feed_url,
+       content_hash = excluded.content_hash,
+       raw_feed_item_json = excluded.raw_feed_item_json,
+       updated_at = excluded.updated_at`
+  ).bind(
+    reviewId,
+    source.id,
+    item.url,
+    item.title,
+    item.summary || null,
+    item.author || null,
+    item.publishedAt || null,
+    source.feed_url,
+    hash,
+    JSON.stringify(item),
+    now
+  ).run();
+
+  const row = await env.DB.prepare("SELECT review_id FROM rss_review_articles WHERE url = ?")
+    .bind(item.url)
+    .first();
+  return row.review_id;
+}
+
+async function saveReviewMatches(env, reviewId, matches) {
+  let saved = 0;
+  const statements = matches.map((match) => env.DB.prepare(
+    `INSERT OR REPLACE INTO rss_review_mentions
+       (review_id, entity_source_id, entity_type, display_name, matched_text, confidence, context, entity_payload_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    reviewId,
+    match.entity.id,
+    match.entity.entity_type,
+    match.entity.display_name,
+    match.matchedText,
+    match.confidence,
+    match.context,
+    JSON.stringify(reviewEntityPayload(match.entity))
+  ));
+
+  if (statements.length === 0) return 0;
+  const results = await env.DB.batch(statements);
+  for (const result of results) {
+    saved += result.meta?.changes || 0;
+  }
+  return saved;
+}
+
+async function upsertApprovedArticle(env, article, articleId) {
+  const now = new Date().toISOString();
   await env.DB.prepare(
     `INSERT INTO d1_articles
        (article_id, title, resource_type, publisher, url, summary, created_at, updated_at)
@@ -152,11 +240,11 @@ async function upsertArticle(env, source, item) {
        updated_at = excluded.updated_at`
   ).bind(
     articleId,
-    item.title,
+    article.title,
     "rss",
-    source.name,
-    item.url,
-    item.summary || null,
+    article.source_name || "RSS",
+    article.url,
+    article.summary || null,
     now,
     now
   ).run();
@@ -175,84 +263,79 @@ async function upsertArticle(env, source, item) {
        last_seen_at = excluded.last_seen_at`
   ).bind(
     articleId,
-    source.id,
-    source.feed_url,
-    item.author || null,
-    item.publishedAt || null,
-    hash,
-    JSON.stringify(item),
+    article.source_id || null,
+    article.feed_url || null,
+    article.author || null,
+    article.published_at || null,
+    article.content_hash,
+    article.raw_feed_item_json || null,
     now,
     now
   ).run();
-
-  return articleId;
 }
 
-async function saveMatches(env, articleId, matches) {
-  let saved = 0;
+async function saveApprovedMatches(env, articleId, mentions) {
   const statements = [];
 
-  for (const match of matches) {
+  for (const mention of mentions) {
+    const entity = parseJsonObject(mention.entity_payload_json);
     statements.push(env.DB.prepare(
       `INSERT OR REPLACE INTO rss_article_mentions
          (article_id, entity_source_id, entity_type, display_name, matched_text, confidence, context)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       articleId,
-      match.entity.id,
-      match.entity.entity_type,
-      match.entity.display_name,
-      match.matchedText,
-      match.confidence,
-      match.context
+      mention.entity_source_id,
+      mention.entity_type,
+      mention.display_name,
+      mention.matched_text,
+      mention.confidence,
+      mention.context
     ));
 
-    if (match.entity.entity_type === "bill") {
+    if (mention.entity_type === "bill") {
       statements.push(env.DB.prepare(
         `INSERT OR IGNORE INTO d1_article_bills
            (article_id, sessionyear, condensedbillno, legislationid, bill_label_raw)
          VALUES (?, ?, ?, ?, ?)`
       ).bind(
         articleId,
-        match.entity.sessionyear || null,
-        match.entity.condensedbillno,
-        match.entity.legislationid || null,
-        match.matchedText
+        entity.sessionyear || null,
+        entity.condensedbillno,
+        entity.legislationid || null,
+        mention.matched_text
       ));
     }
 
-    if (match.entity.entity_type === "legislator") {
+    if (mention.entity_type === "legislator") {
       statements.push(env.DB.prepare(
         `INSERT OR IGNORE INTO d1_article_legislators
            (article_id, personid, employeeno, legislator_name_raw)
          VALUES (?, ?, ?, ?)`
       ).bind(
         articleId,
-        match.entity.personid || null,
-        match.entity.employeeno || null,
-        match.matchedText
+        entity.personid || null,
+        entity.employeeno || null,
+        mention.matched_text
       ));
     }
 
-    if (match.entity.entity_type === "candidate") {
+    if (mention.entity_type === "candidate") {
       statements.push(env.DB.prepare(
         `INSERT OR IGNORE INTO d1_article_candidates
            (article_id, filer_entity_number, candidate_name_raw)
          VALUES (?, ?, ?)`
       ).bind(
         articleId,
-        match.entity.filer_entity_number,
-        match.matchedText
+        entity.filer_entity_number,
+        mention.matched_text
       ));
     }
   }
 
   if (statements.length === 0) return 0;
   const results = await env.DB.batch(statements);
-  for (const result of results) {
-    saved += result.meta?.changes || 0;
-  }
-  return saved;
+  return results.reduce((total, result) => total + (result.meta?.changes || 0), 0);
 }
 
 async function listSources(env) {
@@ -288,6 +371,381 @@ async function listRecentMatches(env, limit) {
      FROM recent_entity_mentions
      LIMIT ?`
   ).bind(limit).all();
+  return results || [];
+}
+
+async function listReviewArticles(env, options = {}) {
+  const status = options.status || "pending";
+  const limit = options.limit || 100;
+  const { results } = await env.DB.prepare(
+    `SELECT
+       r.review_id, r.status, r.title, r.url, r.summary, r.author, r.published_at,
+       r.created_at, r.updated_at, r.approved_article_id, r.notes,
+       s.name AS source_name,
+       GROUP_CONCAT(m.entity_type || ':' || m.display_name || ' (' || ROUND(m.confidence, 2) || ')', '; ') AS matches
+     FROM rss_review_articles r
+     LEFT JOIN rss_sources s ON s.id = r.source_id
+     LEFT JOIN rss_review_mentions m ON m.review_id = r.review_id
+     WHERE r.status = ?
+     GROUP BY r.review_id
+     ORDER BY COALESCE(r.published_at, r.created_at) DESC
+     LIMIT ?`
+  ).bind(status, limit).all();
+  return results || [];
+}
+
+async function listReviewArticlesDetailed(env, options = {}) {
+  const articles = await listReviewArticles(env, options);
+  const detailed = [];
+  for (const article of articles) {
+    detailed.push({
+      ...article,
+      mentions: await loadReviewMentions(env, article.review_id)
+    });
+  }
+  return detailed;
+}
+
+async function renderReviewPage(env, options = {}) {
+  const articles = await listReviewArticlesDetailed(env, options);
+  const status = options.status || "pending";
+  const tokenHelp = `<label class="token">Review token <input id="review-token" type="password" autocomplete="off" placeholder="x-review-token"></label>`;
+  const tokenWarning = options.tokenConfigured
+    ? ""
+    : `<div class="warning">Approval is disabled until the Worker secret <code>REVIEW_TOKEN</code> is configured.</div>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Legislative RSS Review</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --panel: #ffffff;
+      --text: #182026;
+      --muted: #62717d;
+      --line: #d9e0e5;
+      --accent: #126b5b;
+      --danger: #a23a2f;
+      --soft: #eef5f3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      background: rgba(255,255,255,.94);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 22px auto 48px;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .toolbar a, button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 8px 12px;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .toolbar a[aria-current="page"] {
+      background: var(--soft);
+      border-color: #9fc7bc;
+      color: var(--accent);
+      font-weight: 650;
+    }
+    .token {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .token input {
+      width: 180px;
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 10px;
+      font: inherit;
+    }
+    .count {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .warning {
+      margin: 0 0 14px;
+      border: 1px solid #e2c36f;
+      background: #fff7dc;
+      color: #614c00;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 14px;
+    }
+    .article {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 14px;
+      padding: 18px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+    }
+    .meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    h2 {
+      margin: 0 0 8px;
+      font-size: 19px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+    h2 a {
+      color: var(--text);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #33424d;
+      line-height: 1.45;
+    }
+    .matches {
+      display: grid;
+      gap: 8px;
+      margin: 14px 0;
+    }
+    .match {
+      border-left: 3px solid #9fc7bc;
+      background: #f8fbfa;
+      padding: 9px 10px;
+      border-radius: 0 6px 6px 0;
+    }
+    .match strong {
+      display: inline-block;
+      margin-right: 8px;
+    }
+    .match small {
+      color: var(--muted);
+    }
+    .context {
+      margin-top: 4px;
+      color: #42515d;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+    }
+    .approve {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: white;
+    }
+    .reject {
+      background: white;
+      border-color: #d7a8a2;
+      color: var(--danger);
+    }
+    .empty {
+      padding: 48px 20px;
+      text-align: center;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+    }
+    @media (max-width: 720px) {
+      header { align-items: flex-start; flex-direction: column; padding: 14px 16px; }
+      main { width: min(100vw - 20px, 1180px); margin-top: 14px; }
+      .actions { justify-content: stretch; }
+      .actions button { flex: 1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Legislative RSS Review</h1>
+    <div class="toolbar">
+      <a href="/review-ui?status=pending" aria-current="${status === "pending" ? "page" : "false"}">Pending</a>
+      <a href="/review-ui?status=approved" aria-current="${status === "approved" ? "page" : "false"}">Approved</a>
+      <a href="/review-ui?status=rejected" aria-current="${status === "rejected" ? "page" : "false"}">Rejected</a>
+      ${tokenHelp}
+    </div>
+  </header>
+  <main>
+    ${tokenWarning}
+    <p class="count">${articles.length} ${escapeHtml(status)} article${articles.length === 1 ? "" : "s"}</p>
+    ${articles.length ? articles.map(renderReviewCard).join("") : `<div class="empty">No ${escapeHtml(status)} articles.</div>`}
+  </main>
+  <script>
+    async function decide(reviewId, action, button) {
+      const card = button.closest(".article");
+      const notes = action === "reject" ? prompt("Optional rejection note", "") : "";
+      button.disabled = true;
+      const headers = { "content-type": "application/json" };
+      const tokenInput = document.querySelector("#review-token");
+      if (tokenInput && tokenInput.value) headers["x-review-token"] = tokenInput.value;
+      const response = await fetch("/" + action, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ reviewId, approvedBy: "review-ui", notes })
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || (result.errors && result.errors.length)) {
+        alert((result.detail || result.error || JSON.stringify(result.errors || result)) || "Action failed");
+        button.disabled = false;
+        return;
+      }
+      card.remove();
+      const count = document.querySelector(".count");
+      const remaining = document.querySelectorAll(".article").length;
+      count.textContent = remaining + " pending article" + (remaining === 1 ? "" : "s");
+    }
+  </script>
+</body>
+</html>`;
+}
+
+function renderReviewCard(article) {
+  const matches = article.mentions.length
+    ? article.mentions.map(renderReviewMention).join("")
+    : `<div class="match">No matches recorded.</div>`;
+  return `<article class="article" data-review-id="${escapeHtml(article.review_id)}">
+    <div class="meta">
+      <span>${escapeHtml(article.source_name || "RSS")}</span>
+      <span>${escapeHtml(article.published_at || article.created_at || "")}</span>
+      <span>${escapeHtml(article.review_id)}</span>
+    </div>
+    <h2><a href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(article.title)}</a></h2>
+    <p>${escapeHtml(article.summary || "")}</p>
+    <div class="matches">${matches}</div>
+    ${article.status === "pending" ? `<div class="actions">
+      <button class="reject" type="button" onclick="decide('${escapeJs(article.review_id)}', 'reject', this)">Deny</button>
+      <button class="approve" type="button" onclick="decide('${escapeJs(article.review_id)}', 'approve', this)">Approve</button>
+    </div>` : ""}
+  </article>`;
+}
+
+function renderReviewMention(mention) {
+  return `<div class="match">
+    <strong>${escapeHtml(mention.display_name)}</strong>
+    <small>${escapeHtml(mention.entity_type)} / ${escapeHtml(mention.matched_text)} / ${Number(mention.confidence || 0).toFixed(2)}</small>
+    <div class="context">${escapeHtml(mention.context || "")}</div>
+  </div>`;
+}
+
+async function approveReviewArticles(env, payload) {
+  const reviewIds = normalizeReviewIds(payload);
+  const approvedBy = compactText(payload?.approvedBy || payload?.approved_by || "reviewer");
+  const notes = compactText(payload?.notes || "");
+  const approved = [];
+  const errors = [];
+
+  for (const reviewId of reviewIds) {
+    try {
+      const article = await loadReviewArticle(env, reviewId);
+      if (!article) {
+        errors.push({ reviewId, error: "Review article not found" });
+        continue;
+      }
+      if (article.status !== "pending") {
+        errors.push({ reviewId, error: `Review article is ${article.status}` });
+        continue;
+      }
+
+      const mentions = await loadReviewMentions(env, reviewId);
+      const articleId = await articleIdForUrl(article.url);
+      await upsertApprovedArticle(env, article, articleId);
+      const mentionsSaved = await saveApprovedMatches(env, articleId, mentions);
+
+      await env.DB.prepare(
+        `UPDATE rss_review_articles
+         SET status = 'approved', approved_article_id = ?, approved_by = ?, notes = ?, approved_at = ?, updated_at = ?
+         WHERE review_id = ?`
+      ).bind(articleId, approvedBy, notes || article.notes || null, new Date().toISOString(), new Date().toISOString(), reviewId).run();
+
+      approved.push({ reviewId, articleId, mentionsSaved });
+    } catch (error) {
+      errors.push({ reviewId, error: String(error?.message || error) });
+    }
+  }
+
+  return { approved, errors };
+}
+
+async function rejectReviewArticles(env, payload) {
+  const reviewIds = normalizeReviewIds(payload);
+  const notes = compactText(payload?.notes || "");
+  const rejectedAt = new Date().toISOString();
+  const statements = reviewIds.map((reviewId) => env.DB.prepare(
+    `UPDATE rss_review_articles
+     SET status = 'rejected', notes = ?, rejected_at = ?, updated_at = ?
+     WHERE review_id = ? AND status = 'pending'`
+  ).bind(notes || null, rejectedAt, rejectedAt, reviewId));
+
+  if (statements.length === 0) return { rejected: 0 };
+  const results = await env.DB.batch(statements);
+  return { rejected: results.reduce((total, result) => total + (result.meta?.changes || 0), 0) };
+}
+
+async function loadReviewArticle(env, reviewId) {
+  return await env.DB.prepare(
+    `SELECT r.*, s.name AS source_name
+     FROM rss_review_articles r
+     LEFT JOIN rss_sources s ON s.id = r.source_id
+     WHERE r.review_id = ?`
+  ).bind(reviewId).first();
+}
+
+async function loadReviewMentions(env, reviewId) {
+  const { results } = await env.DB.prepare(
+    `SELECT review_id, entity_source_id, entity_type, display_name, matched_text, confidence, context, entity_payload_json
+     FROM rss_review_mentions
+     WHERE review_id = ?
+     ORDER BY confidence DESC`
+  ).bind(reviewId).all();
   return results || [];
 }
 
@@ -405,6 +863,21 @@ function publicEntity(entity) {
     chamber: entity.chamber,
     district: entity.district,
     terms: entity.terms
+  };
+}
+
+function reviewEntityPayload(entity) {
+  return {
+    id: entity.id,
+    entity_type: entity.entity_type,
+    display_name: entity.display_name,
+    personid: entity.personid,
+    employeeno: entity.employeeno,
+    filer_entity_number: entity.filer_entity_number,
+    sessionyear: entity.sessionyear,
+    legislationid: entity.legislationid,
+    condensedbillno: entity.condensedbillno,
+    expandedbillno: entity.expandedbillno
   };
 }
 
@@ -603,6 +1076,23 @@ function parseJsonArray(value) {
   }
 }
 
+function parseJsonObject(value) {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeReviewIds(payload) {
+  if (Array.isArray(payload?.reviewIds)) return payload.reviewIds.map(compactText).filter(Boolean);
+  if (Array.isArray(payload?.review_ids)) return payload.review_ids.map(compactText).filter(Boolean);
+  if (payload?.reviewId) return [compactText(payload.reviewId)].filter(Boolean);
+  if (payload?.review_id) return [compactText(payload.review_id)].filter(Boolean);
+  return [];
+}
+
 function readPositiveInt(primary, fallback, defaultValue) {
   const value = Number(primary || fallback || defaultValue);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : defaultValue;
@@ -618,6 +1108,24 @@ async function articleIdForUrl(url) {
   return `rss_${(await sha256Hex(url)).slice(0, 24)}`;
 }
 
+async function reviewIdForUrl(url) {
+  return `review_${(await sha256Hex(url)).slice(0, 24)}`;
+}
+
+async function requireReviewToken(request, env) {
+  if (!env.REVIEW_TOKEN) {
+    const error = new Error("REVIEW_TOKEN is not configured");
+    error.status = 503;
+    throw error;
+  }
+  const provided = request.headers.get("x-review-token") || "";
+  if (provided !== env.REVIEW_TOKEN) {
+    const error = new Error("Unauthorized");
+    error.status = 401;
+    throw error;
+  }
+}
+
 function json(body, status = 200) {
   return new Response(JSON.stringify(body, null, 2), {
     status,
@@ -625,4 +1133,30 @@ function json(body, status = 200) {
       "content-type": "application/json; charset=utf-8"
     }
   });
+}
+
+function html(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8"
+    }
+  });
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeJs(value) {
+  return String(value ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r");
 }
